@@ -91,10 +91,10 @@ class FreeAnchorRetinaHead(RetinaHead):
             bbox_pred.permute(0, 2, 3, 1).reshape(bbox_pred.size(0), -1, 4)
             for bbox_pred in bbox_preds
         ]
-        cls_scores = torch.cat(cls_scores, dim=1)
-        bbox_preds = torch.cat(bbox_preds, dim=1)
+        cls_scores = torch.cat(cls_scores, dim=1)#shape:[N,num_anchors*H*W*level_num,num_classes]
+        bbox_preds = torch.cat(bbox_preds, dim=1)#shape:[N,num_anchors*H*W*level_num,4]
 
-        cls_prob = torch.sigmoid(cls_scores)
+        cls_prob = torch.sigmoid(cls_scores)#cls_prob shape:(N,num_anchors*H*W*level_num,num_classes)
         box_prob = []
         num_pos = 0
         positive_losses = []
@@ -112,12 +112,13 @@ class FreeAnchorRetinaHead(RetinaHead):
                     pred_boxes = self.bbox_coder.decode(anchors_, bbox_preds_)
 
                     # object_box_iou: IoU_{ij}^{loc}, shape: [i, j]
-                    object_box_iou = bbox_overlaps(gt_bboxes_, pred_boxes)
+                    object_box_iou = bbox_overlaps(gt_bboxes_, pred_boxes)#shape:(gt_num,all_anchor_num),all_anchor_num=num_anchors*H*W*level_num,num_classes
 
                     # object_box_prob: P{a_{j} -> b_{i}}, shape: [i, j]
                     t1 = self.bbox_thr
                     t2 = object_box_iou.max(
                         dim=1, keepdim=True).values.clamp(min=t1 + 1e-12)
+                    #object_box_prob shape:(gt_num,anchor_num)
                     object_box_prob = ((object_box_iou - t1) /
                                        (t2 - t1)).clamp(
                                            min=0, max=1)
@@ -129,7 +130,7 @@ class FreeAnchorRetinaHead(RetinaHead):
                     ],
                                           dim=0)
                     object_cls_box_prob = torch.sparse_coo_tensor(
-                        indices, object_box_prob)
+                        indices, object_box_prob)#object_cls_box_prob shape:(gt_num,class_num,all_anchor_num)
 
                     # image_box_iou: P{a_{j} \in A_{+}}, shape: [c, j]
                     """
@@ -155,7 +156,7 @@ class FreeAnchorRetinaHead(RetinaHead):
                                 0
                             ]).type_as(object_box_prob)).max(dim=0).values
 
-                        # upmap to shape [j, c]
+                        # upmap to shape [j, c]，image_box_prob size:(all_num_anchor,num_class)
                         image_box_prob = torch.sparse_coo_tensor(
                             indices.flip([0]),
                             nonzero_box_prob,
@@ -163,10 +164,11 @@ class FreeAnchorRetinaHead(RetinaHead):
                                   self.cls_out_channels)).to_dense()
                     # end
 
-                box_prob.append(image_box_prob)
+                box_prob.append(image_box_prob)#box_prob size:Nx(all_anchor_num,num_classes)
 
             # construct bags for objects
             match_quality_matrix = bbox_overlaps(gt_bboxes_, anchors_)
+            #matched shape:(gt_num,topK)
             _, matched = torch.topk(
                 match_quality_matrix,
                 self.pre_anchor_topk,
@@ -174,7 +176,7 @@ class FreeAnchorRetinaHead(RetinaHead):
                 sorted=False)
             del match_quality_matrix
 
-            # matched_cls_prob: P_{ij}^{cls}
+            # matched_cls_prob: P_{ij}^{cls},shape:(gt_num,topK)
             matched_cls_prob = torch.gather(
                 cls_prob_[matched], 2,
                 gt_labels_.view(-1, 1, 1).repeat(1, self.pre_anchor_topk,
@@ -198,7 +200,7 @@ class FreeAnchorRetinaHead(RetinaHead):
         positive_loss = torch.cat(positive_losses).sum() / max(1, num_pos)
 
         # box_prob: P{a_{j} \in A_{+}}
-        box_prob = torch.stack(box_prob, dim=0)
+        box_prob = torch.stack(box_prob, dim=0)#box_prob size:(N,anchor_num,num_classes)
 
         # negative_loss:
         # \sum_{j}{ FL((1 - P{a_{j} \in A_{+}}) * (1 - P_{j}^{bg})) } / n||B||
@@ -235,13 +237,14 @@ class FreeAnchorRetinaHead(RetinaHead):
             Tensor: Positive bag loss in shape (num_gt,).
         """  # noqa: E501, W605
         # bag_prob = Mean-max(matched_prob)
-        matched_prob = matched_cls_prob * matched_box_prob
+        matched_prob = matched_cls_prob * matched_box_prob#shape:(num_gt, pre_anchor_topk)
         weight = 1 / torch.clamp(1 - matched_prob, 1e-12, None)
-        weight /= weight.sum(dim=1).unsqueeze(dim=-1)
-        bag_prob = (weight * matched_prob).sum(dim=1)
+        weight /= weight.sum(dim=1).unsqueeze(dim=-1)#weight shape:(num_gt,pre_anchor_topk)
+        bag_prob = (weight * matched_prob).sum(dim=1)#完成min-max函数输出，shape:(num_gt,1)
         # positive_bag_loss = -self.alpha * log(bag_prob)
+        # binary_cross_entropy与BCELoss基本等价.input和target的shape必须一致，衡量的是两者的差异，其中taget中的值应该介于0到1之间
         return self.alpha * F.binary_cross_entropy(
-            bag_prob, torch.ones_like(bag_prob), reduction='none')
+            bag_prob, torch.ones_like(bag_prob), reduction='none')#对应论文中的-[1*log(bag_prob)+0*log(1-bag_prob)]=-log(bag_prob)
 
     def negative_bag_loss(self, cls_prob, box_prob):
         """Compute negative bag loss.
@@ -261,7 +264,7 @@ class FreeAnchorRetinaHead(RetinaHead):
         Returns:
             Tensor: Negative bag loss in shape (num_img, num_anchors, num_classes).
         """  # noqa: E501, W605
-        prob = cls_prob * (1 - box_prob)
+        prob = cls_prob * (1 - box_prob)#prob shape:(num_img, num_anchors, num_classes)
         # There are some cases when neg_prob = 0.
         # This will cause the neg_prob.log() to be inf without clamp.
         prob = prob.clamp(min=EPS, max=1 - EPS)
